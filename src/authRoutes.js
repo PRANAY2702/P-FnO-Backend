@@ -1,0 +1,152 @@
+/**
+ * authRoutes.js
+ * Express routes for local + Google OAuth authentication.
+ *
+ * Endpoints:
+ *   POST /api/auth/register      – Create account with email/password
+ *   POST /api/auth/login         – Login with email/password → JWT
+ *   GET  /api/auth/google        – Redirect to Google OAuth
+ *   GET  /api/auth/google/callback – Google OAuth callback → redirect with token
+ *   GET  /api/auth/me            – Get current user (requires Bearer token)
+ *   POST /api/auth/logout        – Logout (client should discard token)
+ */
+
+const express = require("express");
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const {
+  generateToken,
+  verifyToken,
+  createUser,
+  findUserById,
+  findOrCreateGoogleUser,
+  validatePassword,
+} = require("./authService");
+
+const router = express.Router();
+
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const BACKEND_URL  = process.env.BACKEND_URL  || "http://localhost:3001";
+
+// ─── Passport Google Strategy ─────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+
+if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
+  passport.use(
+    new GoogleStrategy(
+      {
+        clientID: GOOGLE_CLIENT_ID,
+        clientSecret: GOOGLE_CLIENT_SECRET,
+        callbackURL: `${BACKEND_URL}/api/auth/google/callback`,
+      },
+      async (_accessToken, _refreshToken, profile, done) => {
+        try {
+          const user = await findOrCreateGoogleUser({
+            googleId: profile.id,
+            email: profile.emails?.[0]?.value || "",
+            fullName: profile.displayName || "",
+          });
+          done(null, user);
+        } catch (err) {
+          done(err, null);
+        }
+      }
+    )
+  );
+}
+
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser(async (id, done) => {
+  const user = await findUserById(id);
+  done(null, user);
+});
+
+// ─── Auth middleware ──────────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  try {
+    req.user = verifyToken(auth.slice(7));
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// ─── Local register ───────────────────────────────────────────────────────────
+router.post("/register", async (req, res) => {
+  const { userId, email, password, fullName } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+  }
+
+  try {
+    const user = await createUser({ userId, email, password, fullName });
+    const token = generateToken(user);
+    res.status(201).json({ token, user });
+  } catch (err) {
+    res.status(409).json({ error: err.message });
+  }
+});
+
+// ─── Local login ──────────────────────────────────────────────────────────────
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required." });
+  }
+
+  const user = await validatePassword(email, password);
+  if (!user) {
+    return res.status(401).json({ error: "Invalid email or password." });
+  }
+
+  const token = generateToken(user);
+  res.json({ token, user });
+});
+
+// ─── Google OAuth ──────────────────────────────────────────────────────────────
+router.get(
+  "/google",
+  (req, res, next) => {
+    if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+      return res.status(503).json({
+        error: "Google OAuth is not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to .env",
+      });
+    }
+    next();
+  },
+  passport.authenticate("google", { scope: ["profile", "email"] })
+);
+
+router.get(
+  "/google/callback",
+  passport.authenticate("google", { session: false, failureRedirect: `${FRONTEND_URL}/login?error=google_failed` }),
+  (req, res) => {
+    const token = generateToken(req.user);
+    // Redirect to frontend with token in query param (frontend stores it)
+    res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}&user=${encodeURIComponent(JSON.stringify(req.user))}`);
+  }
+);
+
+// ─── Me ───────────────────────────────────────────────────────────────────────
+router.get("/me", requireAuth, async (req, res) => {
+  const user = await findUserById(req.user.id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  res.json({ user });
+});
+
+// ─── Logout ───────────────────────────────────────────────────────────────────
+router.post("/logout", (_req, res) => {
+  res.json({ message: "Logged out. Discard your token on the client." });
+});
+
+module.exports = { router, passport };
