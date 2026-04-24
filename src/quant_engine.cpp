@@ -86,9 +86,69 @@ Napi::Object CalculateAll(const Napi::CallbackInfo& info) {
     return result;
 }
 
+// ─── Newton-Raphson Implied Volatility Solver ────────────────────────────────
+// Finds σ such that BSM(σ) ≈ marketPrice using:
+//   σ_{n+1} = σ_n − (BSM(σ_n) − marketPrice) / Vega(σ_n)
+Napi::Value CalculateIV(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 6 || !info[0].IsNumber() || !info[1].IsNumber() ||
+        !info[2].IsNumber() || !info[3].IsNumber() || !info[4].IsNumber() || !info[5].IsString()) {
+        Napi::TypeError::New(env, "Expected (spot, strike, t, r, marketPrice, type)").ThrowAsJavaScriptException();
+        return Napi::Number::New(env, -1.0);
+    }
+
+    double S           = info[0].As<Napi::Number>().DoubleValue();
+    double K           = info[1].As<Napi::Number>().DoubleValue();
+    double T           = info[2].As<Napi::Number>().DoubleValue();
+    double r           = info[3].As<Napi::Number>().DoubleValue();
+    double marketPrice = info[4].As<Napi::Number>().DoubleValue();
+    std::string type   = info[5].As<Napi::String>().Utf8Value();
+
+    if (T <= 0.0 || marketPrice <= 0.0) {
+        return Napi::Number::New(env, 0.0);
+    }
+
+    // Initial guess using Brenner-Subrahmanyam approximation
+    double sigma = marketPrice / S * std::sqrt(2.0 * PI / T);
+    if (sigma < 0.01) sigma = 0.25; // fallback initial guess
+
+    const int MAX_ITER = 100;
+    const double TOL   = 1e-8;
+
+    for (int i = 0; i < MAX_ITER; ++i) {
+        double d1 = calculate_d1(S, K, T, r, sigma);
+        double d2 = calculate_d2(d1, sigma, T);
+
+        double bsmPrice;
+        if (type == "call") {
+            bsmPrice = S * norm_cdf(d1) - K * std::exp(-r * T) * norm_cdf(d2);
+        } else {
+            bsmPrice = K * std::exp(-r * T) * norm_cdf(-d2) - S * norm_cdf(-d1);
+        }
+
+        double vega = S * norm_pdf(d1) * std::sqrt(T); // un-scaled vega
+
+        if (std::abs(vega) < 1e-12) break; // vega too small, can't iterate
+
+        double diff = bsmPrice - marketPrice;
+        if (std::abs(diff) < TOL) break; // converged
+
+        sigma -= diff / vega;
+
+        // Clamp sigma to prevent divergence
+        if (sigma < 0.001) sigma = 0.001;
+        if (sigma > 5.0)   sigma = 5.0;
+    }
+
+    return Napi::Number::New(env, sigma);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "calculateAll"),
                 Napi::Function::New(env, CalculateAll));
+    exports.Set(Napi::String::New(env, "calculateIV"),
+                Napi::Function::New(env, CalculateIV));
     return exports;
 }
 

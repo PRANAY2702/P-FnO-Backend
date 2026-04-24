@@ -24,7 +24,7 @@
     "passport-google-oauth20": "^2.0.0",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
-    "ws": "^8.20.0"
+    "yahoo-finance2": "^3.14.0"
   },
   "devDependencies": {
     "node-gyp": "^12.2.0"
