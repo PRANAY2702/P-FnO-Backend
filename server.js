@@ -309,7 +309,9 @@ const kotakConfig = {
 
 const kotakHasCredentials = !!(kotakConfig.consumerKey && kotakConfig.consumerSecret);
 
-if (kotakHasCredentials) {
+const USE_YAHOO_FINANCE_ONLY = true;
+
+if (kotakHasCredentials && !USE_YAHOO_FINANCE_ONLY) {
   console.log('─── Kotak Neo credentials detected. Attempting login… ───');
   const kotak = new KotakNeoService(kotakConfig);
 
@@ -325,7 +327,7 @@ if (kotakHasCredentials) {
     startYahooFallback();
   });
 } else {
-  console.log('─── Kotak Neo not configured. Trying Yahoo Finance fallback… ───');
+  console.log('─── Defaulting to Yahoo Finance (Kotak API temporarily disabled)… ───');
   startYahooFallback();
 }
 
