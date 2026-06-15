@@ -21,6 +21,8 @@ const {
   findUserById,
   findOrCreateGoogleUser,
   validatePassword,
+  saveKotakApiKeys,
+  getKotakApiKeys,
 } = require("./authService");
 
 const router = express.Router();
@@ -147,6 +149,130 @@ router.get("/me", requireAuth, async (req, res) => {
 // ─── Logout ───────────────────────────────────────────────────────────────────
 router.post("/logout", (_req, res) => {
   res.json({ message: "Logged out. Discard your token on the client." });
+});
+
+// ─── Save Kotak API Keys ──────────────────────────────────────────────────────
+router.post("/kotak-api", requireAuth, async (req, res) => {
+  const { consumerKey, consumerSecret, mpin } = req.body;
+
+  if (!consumerKey || !consumerSecret || !mpin) {
+    return res.status(400).json({ error: "All API key fields are required." });
+  }
+
+  // Validate credentials with Kotak API
+  try {
+    const axios = require('axios');
+    const creds = `${consumerKey}:${consumerSecret}`;
+    const basicAuth = 'Basic ' + Buffer.from(creds).toString('base64');
+    
+    // Attempt a call that requires valid credentials
+    await axios.post(
+      'https://gw-napi.kotaksecurities.com/login/1.0/login/v2/login/validatePassword',
+      { mobileNumber: '', password: '' },
+      { headers: { 'Content-Type': 'application/json', 'Authorization': basicAuth }, timeout: 5000 }
+    );
+  } catch (err) {
+    // If we get 401/403 or other explicit rejection, keys are invalid
+    if (err.response && (err.response.status === 401 || err.response.status === 403 || err.response.status === 400)) {
+      return res.status(401).json({ error: "Invalid Consumer Key or Secret. Authentication failed." });
+    }
+    // If it's 502/timeout, API might be down but keys could be right, we should still warn but let's be strict for now
+    // Actually, Kotak gives 401 for bad basic auth, 400 for bad request (which means auth passed but payload bad).
+    // Let's accept 400 as a sign that Basic Auth worked.
+    if (err.response && err.response.status !== 400 && err.response.status !== 502) {
+      return res.status(401).json({ error: "Invalid API credentials." });
+    }
+  }
+
+  const updated = await saveKotakApiKeys(req.user.id, { consumerKey, consumerSecret, mpin });
+  if (!updated) {
+    return res.status(404).json({ error: "User not found." });
+  }
+
+  res.json({ message: "Kotak API keys saved successfully.", user: updated });
+});
+
+// ─── Forgot Password (OTP) ────────────────────────────────────────────────────
+router.post("/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required" });
+
+  const { prisma } = require("./authService");
+  if (!prisma) return res.status(500).json({ error: "Database not connected" });
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) {
+    // Return success anyway to prevent email enumeration
+    return res.json({ message: "If that email exists, an OTP was sent." });
+  }
+
+  // Generate 6-digit OTP
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
+
+  await prisma.otp.create({
+    data: { userId: user.id, code: otp, expiresAt }
+  });
+
+  // Since we don't have a real SMTP server configured, we log it to console
+  console.log(`\n\n=== OTP for ${email}: ${otp} ===\n\n`);
+
+  res.json({ message: "OTP sent to email (check backend console for now)" });
+});
+
+router.post("/reset-password", async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+  if (!email || !otp || !newPassword) return res.status(400).json({ error: "Missing fields" });
+
+  const { prisma } = require("./authService");
+  if (!prisma) return res.status(500).json({ error: "Database not connected" });
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  const validOtp = await prisma.otp.findFirst({
+    where: { userId: user.id, code: otp, expiresAt: { gt: new Date() } }
+  });
+
+  if (!validOtp) return res.status(400).json({ error: "Invalid or expired OTP" });
+
+  const bcrypt = require("bcryptjs");
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash }
+  });
+
+  // Delete used OTP
+  await prisma.otp.deleteMany({ where: { userId: user.id } });
+
+  res.json({ message: "Password updated successfully" });
+});
+
+// ─── Google Login ─────────────────────────────────────────────────────────────
+router.post("/google", async (req, res) => {
+  const { token, fullName, email } = req.body;
+  if (!token) return res.status(400).json({ error: "No token provided" });
+
+  // In production, you would verify the token with Firebase Admin SDK:
+  // const admin = require("firebase-admin");
+  // const decodedToken = await admin.auth().verifyIdToken(token);
+  // const googleId = decodedToken.uid;
+  
+  // For this local demo without a configured Firebase project, we'll just trust the email 
+  // passed from the frontend Firebase SDK popup.
+  if (!email) return res.status(400).json({ error: "Email required from Google" });
+  
+  const googleId = "google_" + email; // Mock ID
+
+  try {
+    const user = await findOrCreateGoogleUser({ googleId, email, fullName });
+    const jwtToken = generateToken(user);
+    res.json({ token: jwtToken, user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = { router, passport };
