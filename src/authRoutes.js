@@ -214,10 +214,35 @@ router.post("/forgot-password", async (req, res) => {
     data: { userId: user.id, code: otp, expiresAt }
   });
 
-  // Since we don't have a real SMTP server configured, we log it to console
-  console.log(`\n\n=== OTP for ${email}: ${otp} ===\n\n`);
+  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    const nodemailer = require("nodemailer");
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+      },
+    });
 
-  res.json({ message: "OTP sent to email (check backend console for now)" });
+    try {
+      await transporter.sendMail({
+        from: `"P-FnO Support" <${process.env.EMAIL_USER}>`,
+        to: email,
+        subject: "Your Password Reset OTP",
+        text: `Your OTP for password reset is: ${otp}. It is valid for 15 minutes.`,
+        html: `<p>Your OTP for password reset is: <b style="font-size: 20px;">${otp}</b></p><p>It is valid for 15 minutes.</p>`,
+      });
+      console.log(`OTP sent to ${email}`);
+      res.json({ message: "OTP sent to your email!" });
+    } catch (err) {
+      console.error("Failed to send email:", err);
+      res.status(500).json({ error: "Failed to send OTP email." });
+    }
+  } else {
+    // Fallback if env variables are not configured
+    console.log(`\n\n=== OTP for ${email}: ${otp} ===\n\n`);
+    res.json({ message: "OTP sent to email (check backend console for now)" });
+  }
 });
 
 router.post("/reset-password", async (req, res) => {
