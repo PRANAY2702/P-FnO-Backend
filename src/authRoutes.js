@@ -171,16 +171,15 @@ router.post("/kotak-api", requireAuth, async (req, res) => {
       { mobileNumber: '', password: '' },
       { headers: { 'Content-Type': 'application/json', 'Authorization': basicAuth }, timeout: 5000 }
     );
+    // If we somehow get a 200, the keys might be valid (though unlikely with empty payload)
   } catch (err) {
-    // If we get 401/403 or other explicit rejection, keys are invalid
-    if (err.response && (err.response.status === 401 || err.response.status === 403 || err.response.status === 400)) {
-      return res.status(401).json({ error: "Invalid Consumer Key or Secret. Authentication failed." });
-    }
-    // If it's 502/timeout, API might be down but keys could be right, we should still warn but let's be strict for now
-    // Actually, Kotak gives 401 for bad basic auth, 400 for bad request (which means auth passed but payload bad).
-    // Let's accept 400 as a sign that Basic Auth worked.
-    if (err.response && err.response.status !== 400 && err.response.status !== 502) {
-      return res.status(401).json({ error: "Invalid API credentials." });
+    // Kotak returns 401 for invalid keys. 
+    // It returns 400 for valid keys but bad payload (which is what we sent).
+    if (err.response && err.response.status === 400) {
+      // Basic Auth worked! Proceed.
+    } else {
+      // For 401, 403, network errors, timeouts, etc. we consider it invalid or unreachable
+      return res.status(401).json({ error: "invalid API key" });
     }
   }
 
@@ -225,18 +224,21 @@ router.post("/forgot-password", async (req, res) => {
     });
 
     try {
-      await transporter.sendMail({
+      transporter.sendMail({
         from: `"P-FnO Support" <${process.env.EMAIL_USER}>`,
         to: email,
         subject: "Your Password Reset OTP",
         text: `Your OTP for password reset is: ${otp}. It is valid for 15 minutes.`,
         html: `<p>Your OTP for password reset is: <b style="font-size: 20px;">${otp}</b></p><p>It is valid for 15 minutes.</p>`,
+      }).then(() => {
+        console.log(`OTP sent to ${email}`);
+      }).catch(err => {
+        console.error("Failed to send email:", err);
       });
-      console.log(`OTP sent to ${email}`);
       res.json({ message: "OTP sent to your email!" });
     } catch (err) {
-      console.error("Failed to send email:", err);
-      res.status(500).json({ error: "Failed to send OTP email." });
+      console.error("Error setting up email:", err);
+      res.status(500).json({ error: "Failed to process OTP request." });
     }
   } else {
     // Fallback if env variables are not configured
