@@ -199,51 +199,56 @@ router.post("/forgot-password", async (req, res) => {
   const { prisma } = require("./authService");
   if (!prisma) return res.status(500).json({ error: "Database not connected" });
 
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) {
-    // Return success anyway to prevent email enumeration
-    return res.json({ message: "If that email exists, an OTP was sent." });
-  }
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      // Return success anyway to prevent email enumeration
+      return res.json({ message: "If that email exists, an OTP was sent." });
+    }
 
-  // Generate 6-digit OTP
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
+    // Generate 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
 
-  await prisma.otp.create({
-    data: { userId: user.id, code: otp, expiresAt }
-  });
-
-  if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-    const nodemailer = require("nodemailer");
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
+    await prisma.otp.create({
+      data: { userId: user.id, code: otp, expiresAt }
     });
 
-    try {
-      transporter.sendMail({
-        from: `"P-FnO Support" <${process.env.EMAIL_USER}>`,
-        to: email,
-        subject: "Your Password Reset OTP",
-        text: `Your OTP for password reset is: ${otp}. It is valid for 15 minutes.`,
-        html: `<p>Your OTP for password reset is: <b style="font-size: 20px;">${otp}</b></p><p>It is valid for 15 minutes.</p>`,
-      }).then(() => {
-        console.log(`OTP sent to ${email}`);
-      }).catch(err => {
-        console.error("Failed to send email:", err);
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      const nodemailer = require("nodemailer");
+      const transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: {
+          user: process.env.EMAIL_USER,
+          pass: process.env.EMAIL_PASS,
+        },
       });
-      res.json({ message: "OTP sent to your email!" });
-    } catch (err) {
-      console.error("Error setting up email:", err);
-      res.status(500).json({ error: "Failed to process OTP request." });
+
+      try {
+        transporter.sendMail({
+          from: `"P-FnO Support" <${process.env.EMAIL_USER}>`,
+          to: email,
+          subject: "Your Password Reset OTP",
+          text: `Your OTP for password reset is: ${otp}. It is valid for 15 minutes.`,
+          html: `<p>Your OTP for password reset is: <b style="font-size: 20px;">${otp}</b></p><p>It is valid for 15 minutes.</p>`,
+        }).then(() => {
+          console.log(`OTP sent to ${email}`);
+        }).catch(err => {
+          console.error("Failed to send email:", err);
+        });
+        res.json({ message: "OTP sent to your email!" });
+      } catch (err) {
+        console.error("Error setting up email:", err);
+        res.status(500).json({ error: "Failed to process OTP request." });
+      }
+    } else {
+      // Fallback if env variables are not configured
+      console.log(`\n\n=== OTP for ${email}: ${otp} ===\n\n`);
+      res.json({ message: "OTP sent to email (check backend console for now)" });
     }
-  } else {
-    // Fallback if env variables are not configured
-    console.log(`\n\n=== OTP for ${email}: ${otp} ===\n\n`);
-    res.json({ message: "OTP sent to email (check backend console for now)" });
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    res.status(500).json({ error: "An internal server error occurred" });
   }
 });
 
@@ -254,27 +259,32 @@ router.post("/reset-password", async (req, res) => {
   const { prisma } = require("./authService");
   if (!prisma) return res.status(500).json({ error: "Database not connected" });
 
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.status(404).json({ error: "User not found" });
+  try {
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: "User not found" });
 
-  const validOtp = await prisma.otp.findFirst({
-    where: { userId: user.id, code: otp, expiresAt: { gt: new Date() } }
-  });
+    const validOtp = await prisma.otp.findFirst({
+      where: { userId: user.id, code: otp, expiresAt: { gt: new Date() } }
+    });
 
-  if (!validOtp) return res.status(400).json({ error: "Invalid or expired OTP" });
+    if (!validOtp) return res.status(400).json({ error: "Invalid or expired OTP" });
 
-  const bcrypt = require("bcryptjs");
-  const passwordHash = await bcrypt.hash(newPassword, 12);
+    const bcrypt = require("bcryptjs");
+    const passwordHash = await bcrypt.hash(newPassword, 12);
 
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { passwordHash }
-  });
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash }
+    });
 
-  // Delete used OTP
-  await prisma.otp.deleteMany({ where: { userId: user.id } });
+    // Delete used OTP
+    await prisma.otp.deleteMany({ where: { userId: user.id } });
 
-  res.json({ message: "Password updated successfully" });
+    res.json({ message: "Password updated successfully" });
+  } catch (err) {
+    console.error("Reset password error:", err);
+    res.status(500).json({ error: "An internal server error occurred" });
+  }
 });
 
 // ─── Google Login ─────────────────────────────────────────────────────────────
