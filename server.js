@@ -159,8 +159,12 @@ function getNextExpiries(index, count = 4) {
   };
 
   const targetDay = expiryDayOfWeek[index] ?? 4;
+  
+  // Get current time in IST
   const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const istString = now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' });
+  const nowIST = new Date(istString);
+  const today = new Date(nowIST.getFullYear(), nowIST.getMonth(), nowIST.getDate());
 
   // Find the next occurrence of targetDay from today
   let current = new Date(today);
@@ -168,8 +172,7 @@ function getNextExpiries(index, count = 4) {
 
   // If today IS the expiry day and market hasn't closed (before 15:30 IST), include it
   if (daysUntilTarget === 0) {
-    const istHour = now.getUTCHours() + 5 + (now.getUTCMinutes() + 30) / 60;
-    if (istHour >= 15.5) {
+    if (nowIST.getHours() >= 16 || (nowIST.getHours() === 15 && nowIST.getMinutes() >= 30)) {
       // Past 3:30 PM IST — this expiry has passed, move to next week
       current.setDate(current.getDate() + 7);
     }
