@@ -140,6 +140,50 @@ let spots = {
 // REAL EXPIRY DATE CALCULATION
 // ══════════════════════════════════════════════════════════════════════════════
 
+let apiExpiries = {
+  NIFTY: [],
+  BANKNIFTY: [],
+  SENSEX: []
+};
+
+async function fetchExpiriesFromAPI() {
+  const axios = require('axios');
+  const growwMap = {
+    NIFTY: 'nifty',
+    BANKNIFTY: 'nifty-bank',
+    SENSEX: 'sensex'
+  };
+
+  const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+
+  for (const [index, symbol] of Object.entries(growwMap)) {
+    try {
+      const res = await axios.get(`https://groww.in/v1/api/option_chain_service/v1/option_chain/${symbol}`, { timeout: 5000 });
+      if (res.data && res.data.optionChain && res.data.optionChain.expiryDetailsDto) {
+        const dates = res.data.optionChain.expiryDetailsDto.expiryDates.slice(0, 4);
+        
+        apiExpiries[index] = dates.map(d => {
+          // Set to 15:30 IST which is 10:00:00 UTC
+          const dt = new Date(`${d}T10:00:00Z`);
+          const label = `${String(dt.getDate()).padStart(2, '0')} ${MONTHS[dt.getMonth()]}`;
+          
+          const now = new Date();
+          const dte = Math.max(0.0001, (dt - now) / (1000 * 60 * 60 * 24));
+          
+          return { date: dt, label, dte };
+        });
+        console.log(`[API] Expiries for ${index} updated from Groww API: ${apiExpiries[index].map(e => e.label).join(', ')}`);
+      }
+    } catch (err) {
+      // Fallback to manual calculation if API fails
+    }
+  }
+}
+
+// Initial fetch and schedule every 1 hour
+fetchExpiriesFromAPI();
+setInterval(fetchExpiriesFromAPI, 60 * 60 * 1000);
+
 /**
  * Calculates the next N expiry dates for an index.
  * NIFTY:     Weekly Thursday expiry
@@ -149,6 +193,15 @@ let spots = {
  * Returns array of { date: Date, label: "24 APR", dte: number }
  */
 function getNextExpiries(index, count = 4) {
+  if (apiExpiries[index] && apiExpiries[index].length > 0) {
+    // Re-calculate DTE since time has passed
+    const now = new Date();
+    return apiExpiries[index].slice(0, count).map(e => ({
+      ...e,
+      dte: Math.max(0.0001, (e.date - now) / (1000 * 60 * 60 * 24))
+    }));
+  }
+
   const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
 
   // Day of week for expiry: 0=Sun,1=Mon,...,4=Thu,5=Fri,6=Sat
