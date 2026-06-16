@@ -214,6 +214,10 @@ router.post("/forgot-password", async (req, res) => {
       data: { userId: user.id, code: otp, expiresAt }
     });
 
+    // ALWAYS print the OTP to the console so it can be retrieved from Render logs
+    // because Render free tier blocks outbound SMTP ports.
+    console.log(`\n\n=== [DEV/RENDER] OTP for ${email}: ${otp} ===\n\n`);
+
     if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
       const nodemailer = require("nodemailer");
       const transporter = nodemailer.createTransport({
@@ -244,7 +248,7 @@ router.post("/forgot-password", async (req, res) => {
     } else {
       // Fallback if env variables are not configured
       console.log(`\n\n=== OTP for ${email}: ${otp} ===\n\n`);
-      res.json({ message: "OTP sent to email (check backend console for now)" });
+      res.json({ message: "OTP sent to email !" });
     }
   } catch (err) {
     console.error("Forgot password error:", err);
