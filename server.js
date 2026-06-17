@@ -206,9 +206,9 @@ function getNextExpiries(index, count = 4) {
 
   // Day of week for expiry: 0=Sun,1=Mon,...,4=Thu,5=Fri,6=Sat
   const expiryDayOfWeek = {
-    NIFTY: 4,     // Thursday
+    NIFTY: 4,     // Thursday (Note: adjust to 2 if NSE shifted)
     BANKNIFTY: 3, // Wednesday
-    SENSEX: 5     // Friday
+    SENSEX: 4     // Thursday
   };
 
   const targetDay = expiryDayOfWeek[index] ?? 4;
@@ -236,7 +236,12 @@ function getNextExpiries(index, count = 4) {
   const expiries = [];
   for (let i = 0; i < count; i++) {
     const expiryDate = new Date(current);
-    const dte = Math.max(0.0001, (expiryDate - today) / (1000 * 60 * 60 * 24));
+    expiryDate.setHours(15, 30, 0, 0); // Expiry at 3:30 PM IST
+    
+    // Correct continuous time-to-expiry used by other brokers
+    const nowPrecise = new Date();
+    const dte = Math.max(0.0001, (expiryDate - nowPrecise) / (1000 * 60 * 60 * 24));
+    
     const label = `${String(expiryDate.getDate()).padStart(2, '0')} ${MONTHS[expiryDate.getMonth()]}`;
     expiries.push({ date: expiryDate, label, dte });
 
