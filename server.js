@@ -7,11 +7,32 @@ const session = require('express-session');
 const cookieParser = require('cookie-parser');
 const { router: authRouter, passport } = require('./src/authRoutes');
 const KotakNeoService = require('./src/kotakNeoService');
+const UpstoxService = require('./src/upstoxService');
+const upstoxClient = new UpstoxService();
 const YahooFinance = require('yahoo-finance2').default;
 const yahooFinance = new YahooFinance();
 
 // ── C++ Quant Engine (with JS fallback) ─────────────────────────────────────
 let quantEngine;
+// Simple in‑memory wallet store (persisted to JSON)
+const walletFile = path.resolve(__dirname, 'wallets.json');
+let wallets = {};
+try {
+  if (fs.existsSync(walletFile)) wallets = JSON.parse(fs.readFileSync(walletFile, 'utf8'));
+} catch (e) { console.warn('Failed to load wallets:', e.message); }
+
+function saveWallets() {
+  try { fs.writeFileSync(walletFile, JSON.stringify(wallets, null, 2)); } catch (e) { console.warn('Failed to save wallets:', e.message); }
+}
+
+function getBalance(userId) { return wallets[userId]?.balance || 0; }
+function adjustBalance(userId, delta) { // delta can be positive or negative
+  const cur = getBalance(userId);
+  const newBal = cur + delta;
+  if (newBal < 0) throw new Error('Insufficient wallet balance');
+  wallets[userId] = { balance: newBal };
+  saveWallets();
+}
 try {
   quantEngine = require('./build/Release/quant_engine.node');
   console.log('✓ C++ Quant Engine (N-API) loaded — Black-Scholes + Newton-Raphson IV');
@@ -386,6 +407,7 @@ io.on('connection', (socket) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 let dataSource = 'simulation'; // tracks active source
+let yahooInterval = null;
 
 // ── Source 1: Kotak Neo (Primary) ───────────────────────────────────────────
 const kotakConfig = {
@@ -395,22 +417,30 @@ const kotakConfig = {
   password:       process.env.KOTAK_PASSWORD         || '',
   totp:           process.env.KOTAK_TOTP             || '',
   mpin:           process.env.KOTAK_MPIN             || '',
+  ucc:            process.env.KOTAK_UCC              || '',
   environment:    process.env.KOTAK_ENVIRONMENT      || 'prod'
 };
 
-const kotakHasCredentials = !!(kotakConfig.consumerKey && kotakConfig.consumerSecret);
+const kotakHasCredentials = !!kotakConfig.consumerKey;
 
-const USE_YAHOO_FINANCE_ONLY = true;
+const USE_YAHOO_FINANCE_ONLY = false;
+
+let kotakServiceInstance = null;
 
 if (kotakHasCredentials && !USE_YAHOO_FINANCE_ONLY) {
   console.log('─── Kotak Neo credentials detected. Attempting login… ───');
   const kotak = new KotakNeoService(kotakConfig);
+  kotakServiceInstance = kotak;
 
   kotak.on('tick', ({ token, price }) => {
     if (token === 'Nifty 50'  || token === '26000') spots.NIFTY     = price;
     if (token === 'Nifty Bank' || token === '26009') spots.BANKNIFTY = price;
     if (token === 'SENSEX'     || token === '1')     spots.SENSEX    = price;
     dataSource = 'kotak-neo';
+  });
+
+  kotak.on('error', (err) => {
+    console.error('[KotakNeo] Service error:', err.message);
   });
 
   kotak.login().catch(err => {
@@ -423,7 +453,6 @@ if (kotakHasCredentials && !USE_YAHOO_FINANCE_ONLY) {
 }
 
 // ── Source 2: Yahoo Finance (Secondary fallback) ────────────────────────────
-let yahooInterval = null;
 
 async function startYahooFallback() {
   try {
@@ -572,7 +601,7 @@ app.get('/api/prices/historical', async (req, res) => {
   todayStart.setHours(0, 0, 0, 0);
 
   const rangeMap = {
-    '1d': { period1: todayStart, interval: '5m' },
+    '1d': { period1: todayStart, interval: '1m' },
     '1w': { period1: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), interval: '15m' },
     '1m': { period1: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), interval: '1d' },
     '1y': { period1: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000), interval: '1d' },
@@ -644,26 +673,40 @@ app.post('/api/orders/place', async (req, res) => {
 
   // Attempt to place order via Kotak Neo Trade API
   try {
-    const axios = require('axios');
-    const creds = `${kotakKeys.consumerKey}:${kotakKeys.consumerSecret}`;
-    const basicAuth = 'Basic ' + Buffer.from(creds).toString('base64');
+    let orderId = `SIM-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    let isLive = false;
 
-    // Step 1: Quick session check / login
-    const loginRes = await axios.post(
-      'https://gw-napi.kotaksecurities.com/login/1.0/login/v2/login/validatePassword',
-      { mobileNumber: '', password: '' },
-      { headers: { 'Content-Type': 'application/json', 'Authorization': basicAuth }, timeout: 5000 }
-    ).catch(() => null);
+    if (kotakServiceInstance && kotakServiceInstance.tradingToken) {
+      // Approximation for trading symbol. Real NSE_FO symbols are like "NIFTY24MAY22000CE"
+      const ts = `${instrument}${strike}${optionType}`; 
+      const orderParams = {
+         ts: ts,
+         tt: orderType === 'BUY' ? 'B' : 'S',
+         qt: quantity,
+         pt: orderMode === 'LIMIT' ? 'LMT' : 'MKT',
+         pr: orderMode === 'LIMIT' ? price.toString() : '0',
+         es: "nse_fo", 
+         pc: "NRML" 
+      };
 
-    // If live API is not reachable, simulate the order
-    const orderId = `SIM-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+      try {
+        const liveOrderRes = await kotakServiceInstance.placeOrder(orderParams);
+        if (liveOrderRes && liveOrderRes.nOrdNo) {
+            orderId = liveOrderRes.nOrdNo;
+            isLive = true;
+        }
+      } catch (liveErr) {
+        console.warn('[KotakNeo] Live order failed, falling back to simulation.', liveErr.message);
+      }
+    }
 
-    console.log(`[Order] ${orderType} ${quantity}x ${instrument} ${strike} ${optionType} @ ${orderMode === 'LIMIT' ? price : 'MKT'} — User: ${user.email} — OrderID: ${orderId}`);
+    const broker = isLive ? 'kotak-neo' : 'simulated';
+    console.log(`[Order] ${orderType} ${quantity}x ${instrument} ${strike} ${optionType} @ ${orderMode === 'LIMIT' ? price : 'MKT'} — User: ${user.email} — OrderID: ${orderId} — Broker: ${broker}`);
 
     res.json({
       orderId,
       status: 'PLACED',
-      message: `Order ${orderId} placed successfully via ${loginRes ? 'Kotak Neo' : 'Simulated Engine'}`,
+      message: `Order ${orderId} placed successfully via ${broker}`,
       details: {
         instrument,
         strike,
@@ -673,11 +716,276 @@ app.post('/api/orders/place', async (req, res) => {
         price: orderMode === 'LIMIT' ? price : spots[instrument] || 0,
         orderMode,
         timestamp: new Date().toISOString(),
-        broker: loginRes ? 'kotak-neo' : 'simulated'
+        broker
       }
     });
   } catch (err) {
     console.error('[Order] Error:', err.message);
     res.status(500).json({ error: 'Order placement failed: ' + err.message });
+  }
+});
+
+// ── Modify Order via Kotak Neo API ────────────────────────────────────────
+app.post('/api/orders/modify', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    verifyToken(auth.slice(7));
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+
+  const { orderNo, instrument, strike, optionType, orderType, quantity, price, orderMode } = req.body;
+
+  if (!orderNo) {
+    return res.status(400).json({ error: 'Missing order number (orderNo)' });
+  }
+
+  try {
+    let isLive = false;
+
+    if (kotakServiceInstance && kotakServiceInstance.tradingToken && !orderNo.startsWith('SIM-')) {
+      const ts = instrument && strike && optionType ? `${instrument}${strike}${optionType}` : "UNKNOWN"; 
+      const orderParams = {
+         no: orderNo,
+         ts: ts,
+         tt: orderType === 'BUY' ? 'B' : 'S',
+         qt: quantity,
+         pt: orderMode === 'LIMIT' ? 'LMT' : 'MKT',
+         pr: orderMode === 'LIMIT' ? price.toString() : '0',
+         es: "nse_fo", 
+         pc: "NRML" 
+      };
+
+      try {
+        const liveOrderRes = await kotakServiceInstance.modifyOrder(orderParams);
+        if (liveOrderRes && liveOrderRes.stat === 'Ok') {
+            isLive = true;
+        } else {
+            throw new Error(liveOrderRes?.emsg || 'Unknown modification error');
+        }
+      } catch (liveErr) {
+        console.warn('[KotakNeo] Live order modification failed.', liveErr.message);
+        return res.status(400).json({ error: 'Kotak Neo is unavailable: ' + liveErr.message });
+      }
+    }
+    // Kotak-only: no Upstox fallback for order modification
+    if (!isLive) {
+      return res.status(400).json({ error: 'Kotak API not ready. Orders can only be modified via Kotak Neo.' });
+    }
+
+    res.json({
+      orderId: orderNo,
+      status: 'MODIFIED',
+      message: `Order ${orderNo} modified successfully via Kotak Neo`
+    });
+  } catch (err) {
+    console.error('[Order Modify] Error:', err.message);
+    res.status(500).json({ error: 'Order modification failed: ' + err.message });
+  }
+});
+
+// ── Cancel Order via Kotak Neo API ────────────────────────────────────────
+app.post('/api/orders/cancel', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    verifyToken(auth.slice(7));
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+
+  const { orderNo, orderType, symOrdId, isAmo, instrument, strike, optionType } = req.body;
+
+  if (!orderNo) {
+    return res.status(400).json({ error: 'Missing order number (orderNo)' });
+  }
+
+  try {
+    let isLive = false;
+
+    if (kotakServiceInstance && kotakServiceInstance.tradingToken && !orderNo.startsWith('SIM-')) {
+      const orderParams = {
+         on: orderNo,
+         am: isAmo ? "YES" : "NO",
+         orderType: orderType || 'REGULAR'
+      };
+
+      if (isAmo) {
+          orderParams.ts = instrument && strike && optionType ? `${instrument}${strike}${optionType}` : "UNKNOWN";
+      }
+
+      if (orderType === 'BO') {
+          if (!symOrdId) return res.status(400).json({ error: 'Missing symOrdId for BO order exit' });
+          orderParams.symOrdId = symOrdId;
+      }
+
+      try {
+        const liveOrderRes = await kotakServiceInstance.cancelOrder(orderParams);
+        if (liveOrderRes && liveOrderRes.stat === 'Ok') {
+            isLive = true;
+        } else {
+            throw new Error(liveOrderRes?.emsg || 'Unknown cancellation error');
+        }
+      } catch (liveErr) {
+        console.warn('[KotakNeo] Live order cancellation failed.', liveErr.message);
+        return res.status(400).json({ error: 'Kotak Neo is unavailable: ' + liveErr.message });
+      }
+    }
+    // Kotak-only: no Upstox fallback for order cancellation
+    if (!isLive) {
+      return res.status(400).json({ error: 'Kotak API not ready. Orders can only be cancelled via Kotak Neo.' });
+    }
+
+    res.json({
+      orderId: orderNo,
+      status: 'CANCELLED',
+      message: `Order ${orderNo} cancelled successfully via Kotak Neo`
+    });
+  } catch (err) {
+    console.error('[Order Cancel] Error:', err.message);
+    res.status(500).json({ error: 'Order cancellation failed: ' + err.message });
+  }
+});
+
+// ── GET Orders Endpoint (Step 4) ───────────────────────────────────────────
+app.get('/api/orders', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    let orders = [];
+    if (kotakServiceInstance && kotakServiceInstance.tradingToken) {
+       const kotakOrders = await kotakServiceInstance.getOrders();
+       if (kotakOrders && kotakOrders.data) {
+           orders = kotakOrders.data;
+       }
+    }
+    res.json({ orders });
+  } catch (err) {
+    console.error('[Orders] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch orders: ' + err.message });
+  }
+});
+
+// ── GET Positions Endpoint (Step 5) ────────────────────────────────────────
+app.get('/api/positions', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    let positions = [];
+    if (kotakServiceInstance && kotakServiceInstance.tradingToken) {
+       const kotakPositions = await kotakServiceInstance.getPositions();
+       if (kotakPositions && kotakPositions.data) {
+           positions = kotakPositions.data; 
+           console.log('KOTAK POSITIONS:', JSON.stringify(positions, null, 2));
+       }
+    }
+    res.json({ positions });
+  } catch (err) {
+    console.error('[Positions] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch positions: ' + err.message });
+  }
+});
+
+// -- Exit All Positions (Kotak only, with retry) ---------------------------
+app.post('/api/orders/exit-all', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try { verifyToken(auth.slice(7)); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+  try {
+    if (!kotakServiceInstance || !kotakServiceInstance.tradingToken) {
+      return res.status(400).json({ error: 'Kotak Neo is unavailable. Cannot exit positions. Please try again shortly or exit manually via the Kotak app.' });
+    }
+    // Cancel all open orders first
+    const ordersRes = await kotakServiceInstance.getOrders();
+    const openOrders = (ordersRes?.data || []).filter(o => o.ordSt === 'open' || o.ordSt === 'trigger pending');
+    for (const o of openOrders) {
+      try { await kotakServiceInstance.cancelOrder({ on: o.nOrdNo, am: 'NO', orderType: 'REGULAR' }); } catch (e) { console.warn('Could not cancel', o.nOrdNo, e.message); }
+    }
+    // Square off positions
+    const posRes = await kotakServiceInstance.getPositions();
+    const netPos = (posRes?.data || []).filter(p => parseInt(p.flQty || 0) !== 0);
+    for (const pos of netPos) {
+      try {
+        await kotakServiceInstance.placeOrder({
+          ts: pos.trdSym,
+          tt: parseInt(pos.flQty) > 0 ? 'S' : 'B',
+          qt: Math.abs(parseInt(pos.flQty)).toString(),
+          pt: 'MKT', pr: '0', es: 'nse_fo', pc: 'NRML'
+        });
+      } catch (e) { console.warn('Could not exit position', pos.trdSym, e.message); }
+    }
+    res.json({ status: 'EXITED', message: 'All positions exited via Kotak Neo.' });
+  } catch (err) {
+    console.error('[Exit All] Error:', err.message);
+    res.status(500).json({ error: 'Exit failed: ' + err.message });
+  }
+});
+
+// -- Upstox Logout ---------------------------------------------------------
+app.post('/api/upstox/logout', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try { verifyToken(auth.slice(7)); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+  try {
+    const result = await upstoxClient.logout();
+    res.json(result);
+  } catch (err) {
+    console.error('[Upstox Logout] Error:', err.message);
+    res.status(500).json({ error: 'Logout failed: ' + err.message });
+  }
+});
+
+// -- Upstox Option Chain (live call/put prices) ----------------------------
+app.get('/api/upstox/option-chain', async (req, res) => {
+  const { instrument_key, expiry_date } = req.query;
+  if (!instrument_key || !expiry_date) {
+    return res.status(400).json({ error: 'Missing instrument_key or expiry_date' });
+  }
+  try {
+    if (!upstoxClient.isReady()) {
+      return res.status(400).json({ error: 'Upstox not configured.' });
+    }
+    const chain = await upstoxClient.getOptionChain(instrument_key, expiry_date);
+    res.json({ data: chain });
+  } catch (err) {
+    console.error('[Upstox OptionChain] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch option chain: ' + err.message });
+  }
+});
+
+// -- Upstox Market Quote ---------------------------------------------------
+app.get('/api/upstox/quote', async (req, res) => {
+  const { instrument_key } = req.query;
+  if (!instrument_key) {
+    return res.status(400).json({ error: 'Missing instrument_key' });
+  }
+  try {
+    if (!upstoxClient.isReady()) {
+      return res.status(400).json({ error: 'Upstox not configured.' });
+    }
+    const quote = await upstoxClient.getQuote(instrument_key);
+    res.json({ data: quote });
+  } catch (err) {
+    console.error('[Upstox Quote] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch quote: ' + err.message });
   }
 });
