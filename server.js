@@ -1,5 +1,7 @@
 require('dotenv').config();
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
@@ -136,6 +138,8 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 app.use('/api/auth', authRouter);
+const { walletRouter } = require('./src/walletRoutes');
+app.use('/api/wallet', walletRouter);
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -205,6 +209,34 @@ async function fetchExpiriesFromAPI() {
 fetchExpiriesFromAPI();
 setInterval(fetchExpiriesFromAPI, 60 * 60 * 1000);
 
+let apiPrevClose = {
+  NIFTY: null,
+  BANKNIFTY: null,
+  SENSEX: null
+};
+
+async function fetchPrevCloseFromAPI() {
+  try {
+    const symbols = {
+      NIFTY: '^NSEI',
+      BANKNIFTY: '^NSEBANK',
+      SENSEX: '^BSESN'
+    };
+    for (const [idx, sym] of Object.entries(symbols)) {
+      const quote = await yahooFinance.quote(sym);
+      if (quote && quote.regularMarketPreviousClose) {
+        apiPrevClose[idx] = quote.regularMarketPreviousClose;
+        console.log(`[API] PrevClose for ${idx} updated: ${apiPrevClose[idx]}`);
+      }
+    }
+  } catch (err) {
+    console.error('Failed to fetch prevClose from YF:', err.message);
+  }
+}
+
+fetchPrevCloseFromAPI();
+setInterval(fetchPrevCloseFromAPI, 60 * 60 * 1000);
+
 /**
  * Calculates the next N expiry dates for an index.
  * NIFTY:     Weekly Thursday expiry
@@ -227,7 +259,7 @@ function getNextExpiries(index, count = 4) {
 
   // Day of week for expiry: 0=Sun,1=Mon,...,4=Thu,5=Fri,6=Sat
   const expiryDayOfWeek = {
-    NIFTY: 4,     // Thursday (Note: adjust to 2 if NSE shifted)
+    NIFTY: 2,     // Tuesday (Note: adjust to 2 if NSE shifted)
     BANKNIFTY: 3, // Wednesday
     SENSEX: 4     // Thursday
   };
@@ -308,7 +340,6 @@ const generateOptionsChain = (spot, daysToExpiry, index) => {
   }
 
   const t = Math.max(0.00001, daysToExpiry / 365.0);
-  // Brokers like Zerodha use r=0 for Black-76 Index Options
   const brokerRiskFreeRate = 0;
   const F = spot * Math.exp(brokerRiskFreeRate * t);
 
@@ -317,13 +348,9 @@ const generateOptionsChain = (spot, daysToExpiry, index) => {
     const moneyness = Math.abs(spot - strike) / spot;
     const volatility = 0.15 + (moneyness * 0.5);
 
-    // Use Black-76 Model using the Future Price, which is the standard for NSE Index Options
-    const callData = calculateBlack76(F, strike, t, brokerRiskFreeRate, volatility, "call");
-    const putData  = calculateBlack76(F, strike, t, brokerRiskFreeRate, volatility, "put");
-
-    // Add mock Greeks to keep UI working
-    callData.delta = 0.5; callData.gamma = 0.01; callData.theta = -5; callData.vega = 10;
-    putData.delta = -0.5; putData.gamma = 0.01; putData.theta = -5; putData.vega = 10;
+    // Use the C++/JS quant engine for full BSM pricing + Greeks
+    const callData = quantEngine.calculateAll(spot, strike, t, riskFreeRate, volatility, 'call');
+    const putData  = quantEngine.calculateAll(spot, strike, t, riskFreeRate, volatility, 'put');
 
     return {
       strike,
@@ -364,9 +391,9 @@ function buildMarketPayload() {
       SENSEX:    parseFloat(spots.SENSEX).toFixed(2)
     },
     prevClose: {
-      NIFTY:     (22000 * 0.993).toFixed(2), // simulated prev close
-      BANKNIFTY: (48000 * 0.985).toFixed(2),
-      SENSEX:    (73000 * 0.991).toFixed(2)
+      NIFTY:     apiPrevClose.NIFTY ? apiPrevClose.NIFTY.toFixed(2) : null,
+      BANKNIFTY: apiPrevClose.BANKNIFTY ? apiPrevClose.BANKNIFTY.toFixed(2) : null,
+      SENSEX:    apiPrevClose.SENSEX ? apiPrevClose.SENSEX.toFixed(2) : null
     },
     // Real expiry date labels (e.g., "24 APR", "01 MAY", ...)
     expiryLabels: {
@@ -403,13 +430,13 @@ io.on('connection', (socket) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DATA SOURCE HIERARCHY:  Kotak Neo → Yahoo Finance → Simulation
+// DATA SOURCES:  Yahoo Finance (Spot Prices) + Kotak Neo (Orders Only)
 // ══════════════════════════════════════════════════════════════════════════════
 
-let dataSource = 'simulation'; // tracks active source
+let dataSource = 'yahoo'; // tracks active source — no simulation mode
 let yahooInterval = null;
 
-// ── Source 1: Kotak Neo (Primary) ───────────────────────────────────────────
+// ── Source 1: Kotak Neo (Order Execution) ───────────────────────────────────
 const kotakConfig = {
   consumerKey:    process.env.KOTAK_CONSUMER_KEY    || '',
   consumerSecret: process.env.KOTAK_CONSUMER_SECRET || '',
@@ -423,21 +450,12 @@ const kotakConfig = {
 
 const kotakHasCredentials = !!kotakConfig.consumerKey;
 
-const USE_YAHOO_FINANCE_ONLY = false;
-
 let kotakServiceInstance = null;
 
-if (kotakHasCredentials && !USE_YAHOO_FINANCE_ONLY) {
-  console.log('─── Kotak Neo credentials detected. Attempting login… ───');
+if (kotakHasCredentials) {
+  console.log('─── Kotak Neo credentials detected. Attempting login (for orders)… ───');
   const kotak = new KotakNeoService(kotakConfig);
   kotakServiceInstance = kotak;
-
-  kotak.on('tick', ({ token, price }) => {
-    if (token === 'Nifty 50'  || token === '26000') spots.NIFTY     = price;
-    if (token === 'Nifty Bank' || token === '26009') spots.BANKNIFTY = price;
-    if (token === 'SENSEX'     || token === '1')     spots.SENSEX    = price;
-    dataSource = 'kotak-neo';
-  });
 
   kotak.on('error', (err) => {
     console.error('[KotakNeo] Service error:', err.message);
@@ -445,23 +463,25 @@ if (kotakHasCredentials && !USE_YAHOO_FINANCE_ONLY) {
 
   kotak.login().catch(err => {
     console.error('[KotakNeo] Login failed:', err.message);
-    startYahooFallback();
   });
 } else {
-  console.log('─── Defaulting to Yahoo Finance (Kotak API temporarily disabled)… ───');
-  startYahooFallback();
+  console.log('─── Kotak Neo credentials not configured. Orders will be unavailable. ───');
 }
+
+// Always start Yahoo Finance for spot price data
+console.log('─── Starting Yahoo Finance for live spot prices… ───');
+startYahooFallback();
 
 // ── Source 2: Yahoo Finance (Secondary fallback) ────────────────────────────
 
 async function startYahooFallback() {
   try {
     const YahooFinance = require('yahoo-finance2').default;
-    const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+    const yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
     async function fetchYahooPrices() {
       try {
-        const quotes = await yahooFinance.quote(['^NSEI', '^NSEBANK', '^BSESN']);
+        const quotes = await yf.quote(['^NSEI', '^NSEBANK', '^BSESN']);
         quotes.forEach(q => {
           if (q.symbol === '^NSEI'     && q.regularMarketPrice) spots.NIFTY     = q.regularMarketPrice;
           if (q.symbol === '^NSEBANK'  && q.regularMarketPrice) spots.BANKNIFTY = q.regularMarketPrice;
@@ -473,10 +493,6 @@ async function startYahooFallback() {
         }
       } catch (err) {
         console.warn('Yahoo Finance error:', err.message);
-        if (dataSource !== 'simulation') {
-          console.log('⚠ Falling back to simulation mode.');
-          dataSource = 'simulation';
-        }
       }
     }
 
@@ -484,57 +500,65 @@ async function startYahooFallback() {
     fetchYahooPrices();
     yahooInterval = setInterval(fetchYahooPrices, 3000);
   } catch (err) {
-    console.warn('yahoo-finance2 not available:', err.message);
-    console.log('⚠ Running in simulation mode.');
-    dataSource = 'simulation';
+    console.error('yahoo-finance2 not available:', err.message);
   }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// REAL-TIME PORTFOLIO & RISK ENGINE
+// REAL-TIME PORTFOLIO & RISK ENGINE (Live Kotak Data)
 // ══════════════════════════════════════════════════════════════════════════════
 
-let mockMargin = {
-  total: 500000,
-  used: 124500,
-  available: 375500,
-  maxDrawdownPct: 0,
-  peakCapital: 500000,
-  runningPnL: 0
-};
+let portfolioHistory = []; // Equity curve from real positions
+let peakCapital = 0;
+let maxDrawdownPct = 0;
 
-let mockPortfolioHistory = []; // For equity curve
+async function buildPortfolioData() {
+  let margin = { total: 0, used: 0, available: 0, maxDrawdownPct: 0, runningPnL: 0 };
+  try {
+    if (kotakServiceInstance && kotakServiceInstance.tradingToken) {
+      const posRes = await kotakServiceInstance.getPositions();
+      const positions = posRes?.data || [];
+      let totalPnL = 0;
+      let totalUsed = 0;
+      positions.forEach(p => {
+        const pnl = parseFloat(p.netAmt || p.urmToPrc || '0');
+        totalPnL += pnl;
+        totalUsed += Math.abs(parseFloat(p.buyAmt || '0'));
+      });
+      margin.runningPnL = totalPnL;
+      margin.used = totalUsed;
+      // Estimate total margin from wallet balance if available
+      margin.total = totalUsed + Math.abs(totalPnL) + 100000; // baseline
+      margin.available = margin.total - margin.used;
 
-setInterval(() => {
-  // If in simulation mode, add random walk
-  if (dataSource === 'simulation') {
-    spots.NIFTY     += (Math.random() - 0.5) * 10;
-    spots.BANKNIFTY += (Math.random() - 0.5) * 25;
-    spots.SENSEX    += (Math.random() - 0.5) * 30;
+      const currentCapital = margin.total + totalPnL;
+      if (currentCapital > peakCapital) peakCapital = currentCapital;
+      if (peakCapital > 0) {
+        const dd = ((peakCapital - currentCapital) / peakCapital) * 100;
+        maxDrawdownPct = Math.max(maxDrawdownPct, dd);
+      }
+      margin.maxDrawdownPct = maxDrawdownPct;
+    }
+  } catch (err) {
+    console.warn('[Portfolio] Error fetching live data:', err.message);
   }
-  
-  // Update mock portfolio P&L dynamically
-  const pnlChange = (Math.random() - 0.45) * 2500; // slight drift
-  mockMargin.runningPnL += pnlChange;
-  
-  const currentCapital = mockMargin.total + mockMargin.runningPnL;
-  if (currentCapital > mockMargin.peakCapital) {
-    mockMargin.peakCapital = currentCapital;
-  }
-  
-  const drawdown = ((mockMargin.peakCapital - currentCapital) / mockMargin.peakCapital) * 100;
-  mockMargin.maxDrawdownPct = Math.max(mockMargin.maxDrawdownPct, drawdown);
-  
-  mockPortfolioHistory.push({
+  return margin;
+}
+
+setInterval(async () => {
+  const margin = await buildPortfolioData();
+
+  const currentCapital = margin.total + margin.runningPnL;
+  portfolioHistory.push({
     time: new Date().toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' }),
     equity: currentCapital
   });
-  if (mockPortfolioHistory.length > 50) mockPortfolioHistory.shift();
+  if (portfolioHistory.length > 50) portfolioHistory.shift();
 
   io.emit('market_update', buildMarketPayload());
   io.emit('portfolio_update', {
-    margin: mockMargin,
-    equityCurve: mockPortfolioHistory
+    margin,
+    equityCurve: portfolioHistory
   });
 }, 3000);
 
@@ -570,9 +594,9 @@ app.get('/api/prices/yahoo', (req, res) => {
   res.json({
     source: dataSource,
     prices: {
-      NIFTY:     { price: parseFloat(spots.NIFTY).toFixed(2), simulated: dataSource === 'simulation' },
-      BANKNIFTY: { price: parseFloat(spots.BANKNIFTY).toFixed(2), simulated: dataSource === 'simulation' },
-      SENSEX:    { price: parseFloat(spots.SENSEX).toFixed(2), simulated: dataSource === 'simulation' }
+      NIFTY:     { price: parseFloat(spots.NIFTY).toFixed(2) },
+      BANKNIFTY: { price: parseFloat(spots.BANKNIFTY).toFixed(2) },
+      SENSEX:    { price: parseFloat(spots.SENSEX).toFixed(2) }
     },
     timestamp: new Date().toISOString()
   });
@@ -671,52 +695,47 @@ app.post('/api/orders/place', async (req, res) => {
     return res.status(400).json({ error: 'Missing required order fields' });
   }
 
-  // Attempt to place order via Kotak Neo Trade API
+  // All orders go through Kotak Neo — no simulation fallback
   try {
-    let orderId = `SIM-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-    let isLive = false;
-
-    if (kotakServiceInstance && kotakServiceInstance.tradingToken) {
-      // Approximation for trading symbol. Real NSE_FO symbols are like "NIFTY24MAY22000CE"
-      const ts = `${instrument}${strike}${optionType}`; 
-      const orderParams = {
-         ts: ts,
-         tt: orderType === 'BUY' ? 'B' : 'S',
-         qt: quantity,
-         pt: orderMode === 'LIMIT' ? 'LMT' : 'MKT',
-         pr: orderMode === 'LIMIT' ? price.toString() : '0',
-         es: "nse_fo", 
-         pc: "NRML" 
-      };
-
-      try {
-        const liveOrderRes = await kotakServiceInstance.placeOrder(orderParams);
-        if (liveOrderRes && liveOrderRes.nOrdNo) {
-            orderId = liveOrderRes.nOrdNo;
-            isLive = true;
-        }
-      } catch (liveErr) {
-        console.warn('[KotakNeo] Live order failed, falling back to simulation.', liveErr.message);
-      }
+    if (!kotakServiceInstance || !kotakServiceInstance.tradingToken) {
+      return res.status(503).json({ error: 'Kotak Neo is not connected. Please check your API credentials and try again.' });
     }
 
-    const broker = isLive ? 'kotak-neo' : 'simulated';
-    console.log(`[Order] ${orderType} ${quantity}x ${instrument} ${strike} ${optionType} @ ${orderMode === 'LIMIT' ? price : 'MKT'} — User: ${user.email} — OrderID: ${orderId} — Broker: ${broker}`);
+    const ts = `${instrument}${strike}${optionType}`;
+    const orderParams = {
+       ts: ts,
+       tt: orderType === 'BUY' ? 'B' : 'S',
+       qt: quantity,
+       pt: orderMode === 'LIMIT' ? 'LMT' : 'MKT',
+       pr: orderMode === 'LIMIT' ? price.toString() : '0',
+       es: "nse_fo",
+       pc: "NRML"
+    };
+
+    const liveOrderRes = await kotakServiceInstance.placeOrder(orderParams);
+    if (!liveOrderRes || !liveOrderRes.nOrdNo) {
+      throw new Error(liveOrderRes?.emsg || 'Order rejected by Kotak Neo');
+    }
+
+    const orderId = liveOrderRes.nOrdNo;
+    const tradePrice = orderMode === 'LIMIT' ? parseFloat(price) : (parseFloat(spots[instrument]) || 0);
+
+    console.log(`[Order] ${orderType} ${quantity}x ${instrument} ${strike} ${optionType} @ ${orderMode === 'LIMIT' ? price : 'MKT'} — User: ${user.email} — OrderID: ${orderId} — Broker: kotak-neo`);
 
     res.json({
       orderId,
       status: 'PLACED',
-      message: `Order ${orderId} placed successfully via ${broker}`,
+      message: `Order ${orderId} placed successfully via Kotak Neo`,
       details: {
         instrument,
         strike,
         optionType,
         orderType,
         quantity,
-        price: orderMode === 'LIMIT' ? price : spots[instrument] || 0,
+        price: tradePrice,
         orderMode,
         timestamp: new Date().toISOString(),
-        broker
+        broker: 'kotak-neo'
       }
     });
   } catch (err) {

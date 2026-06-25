@@ -80,7 +80,7 @@ function requireAuth(req, res, next) {
 
 // ─── Local register ───────────────────────────────────────────────────────────
 router.post("/register", async (req, res) => {
-  const { userId, email, password, fullName } = req.body;
+  const { userId, email, password, fullName, broker } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: "Email and password are required." });
@@ -90,7 +90,7 @@ router.post("/register", async (req, res) => {
   }
 
   try {
-    const user = await createUser({ userId, email, password, fullName });
+    const user = await createUser({ userId, email, password, fullName, broker });
     const token = generateToken(user);
     res.status(201).json({ token, user });
   } catch (err) {

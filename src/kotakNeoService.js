@@ -46,7 +46,6 @@ class KotakNeoService extends EventEmitter {
         this.sid         = null;
         this.serverId    = null;
         this.socket      = null;
-        this._simRunning = false;
     }
 
     // ─── Auth header for Step-1 (Basic <base64 key:secret>) ────────────────
@@ -55,28 +54,10 @@ class KotakNeoService extends EventEmitter {
         return 'Basic ' + Buffer.from(creds).toString('base64');
     }
 
-    // ─── Simulation fallback ─────────────────────────────────────────────────
-    startSimulation(reason) {
-        if (this._simRunning) return;
-        this._simRunning = true;
-        console.log(`[KotakNeo] Live data unavailable (${reason}). Using simulated ticks.`);
-
-        const spots = { NIFTY: 22000, BANKNIFTY: 48000, SENSEX: 73000 };
-        setInterval(() => {
-            spots.NIFTY     += (Math.random() - 0.5) * 10;
-            spots.BANKNIFTY += (Math.random() - 0.5) * 25;
-            spots.SENSEX    += (Math.random() - 0.5) * 30;
-
-            this.emit('tick', { token: 'Nifty 50',  price: spots.NIFTY });
-            this.emit('tick', { token: 'Nifty Bank', price: spots.BANKNIFTY });
-            this.emit('tick', { token: 'SENSEX',     price: spots.SENSEX });
-        }, 1000);
-    }
-
     // ─── Step 1: Trade API Login (V6 TOTP) ──────────────────────────────────
     async login() {
         if (!this.config.consumerKey) {
-            this.startSimulation('Credentials not configured');
+            console.warn('[KotakNeo] No credentials configured. Order execution unavailable.');
             return;
         }
 
@@ -543,8 +524,6 @@ class KotakNeoService extends EventEmitter {
         await this.login();
     }
         // No extra code needed here because _scheduleReconnect handles it.
-
-    }
 }
 
 module.exports = KotakNeoService;

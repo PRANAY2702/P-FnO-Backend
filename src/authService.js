@@ -38,7 +38,7 @@ function sanitizeUser(user) {
 }
 
 // ─── User CRUD ────────────────────────────────────────────────────────────────
-async function createUser({ userId, email, password, fullName, provider = "local", googleId = null }) {
+async function createUser({ userId, email, password, fullName, broker, provider = "local", googleId = null }) {
   if (!prisma) throw new Error("Database not connected. Please check your DATABASE_URL and run 'npx prisma generate'.");
   
   const existing = await prisma.user.findFirst({
@@ -56,6 +56,7 @@ async function createUser({ userId, email, password, fullName, provider = "local
       email,
       fullName: fullName || "",
       passwordHash,
+      broker: broker || "Kotak Neo",
       googleId,
       provider,
     },
